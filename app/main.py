@@ -3,10 +3,10 @@
 端点
 ----
 - POST /branches              提交 token ID 建立上下文
-- POST /branches/{id}/fork    从任一已有 token 处分叉（零拷贝继承 KV）
-- POST /branches/{id}/tokens  批量追加 token（超限整批拒绝）
-- DELETE /branches/{id}       关闭分支（最后一个引用关闭后释放 KV）
-- GET  /branches              列出分支与内部引用计数（调试）
+- POST /branches/{id}/fork    从任一已有 token 处分叉（零拷贝继承 KV 视图）
+- POST /branches/{id}/tokens  批量追加 token（只保存新增位置，超限整批拒绝）
+- DELETE /branches/{id}       关闭分支（最后可见引用消失的位置立即释放）
+- GET  /branches              列出分支与内部 KV 段/引用（调试）
 - GET  /stats                 缓存用量
 - GET  /docs                  Swagger UI
 
@@ -54,6 +54,12 @@ class CreateBranchRequest(BaseModel):
         ..., description="用于建立上下文的 token ID 序列；可为空数组"
     )
 
+    model_config = {
+        "json_schema_extra": {
+            "examples": [{"token_ids": [1, 2, 3, 4, 5, 6]}, {"token_ids": []}]
+        }
+    }
+
     @field_validator("token_ids")
     @classmethod
     def _check_range(cls, value: list[int]) -> list[int]:
@@ -69,6 +75,10 @@ class ForkRequest(BaseModel):
         description="保留父分支前 offset 个 token；省略或 null 表示继承完整上下文",
     )
 
+    model_config = {
+        "json_schema_extra": {"examples": [{"offset": 2}, {}]}
+    }
+
     @field_validator("offset")
     @classmethod
     def _non_negative(cls, value: int | None) -> int | None:
@@ -79,6 +89,10 @@ class ForkRequest(BaseModel):
 
 class AppendTokensRequest(BaseModel):
     token_ids: list[int] = Field(..., min_length=1, description="本批追加的 token ID")
+
+    model_config = {
+        "json_schema_extra": {"examples": [{"token_ids": [7, 8]}]}
+    }
 
     @field_validator("token_ids")
     @classmethod
@@ -125,8 +139,10 @@ def create_app() -> FastAPI:
         title="NumPy 单头因果注意力解码 API",
         version="1.0.0",
         description=(
-            "单进程解码服务：提交 token 建立上下文、任意位置分叉（继承 KV）、"
-            "批量追加与关闭。缓存上限按实际保存的 token 位置数计。"
+            "单进程解码服务：提交 token 建立上下文、任意位置分叉（共享继承的 "
+            "K/V 视图）、批量追加（每批只保存新增 token 的 K/V）与关闭"
+            "（最后可见引用消失的位置立即释放）。缓存上限按实际保存的 token "
+            "位置数计。"
         ),
     )
 

@@ -7,6 +7,11 @@
 - :func:`forward_full`：对整段 token 重新计算，作为一致性基准；
 - :func:`init_kv` / :func:`step`：增量解码，复用历史 K/V 缓存。
 两条路径对“最后一个位置”的 next-token logits 数值一致。
+
+为了方便分支存储按“段”共享继承来的 KV，另提供：
+- :func:`encode_batch`：只计算一批新 token 的 K/V（不需要历史）；
+- :func:`logits_over_parts`：在若干 K/V 段（按顺序拼接后的历史）上计算
+  最后一个位置的 next-token logits，无需把历史复制到一个连续数组。
 """
 
 from __future__ import annotations
@@ -86,6 +91,48 @@ def step(
     V_new = np.concatenate([V, v], axis=0)
     logits = logits_from_kv(model, token_id, K_new, V_new)
     return logits, K_new, V_new
+
+
+def encode_batch(
+    model: dict, token_ids: list[int]
+) -> tuple[np.ndarray, np.ndarray]:
+    """只计算一批新 token 自身的 K/V，返回形状 ``[len(batch), D]``。
+
+    每个位置的 K/V 只取决于该位置的 token（本模型没有位置编码与跨层状态），
+    因此新 token 的 K/V 与历史无关，可以直接写入新段，无需重算前缀。
+    """
+    ids = np.asarray(token_ids, dtype=np.int64)
+    x = model["emb"][ids]  # [batch, D]
+    return x @ model["wk"], x @ model["wv"]
+
+
+def logits_over_parts(
+    model: dict, token_id: int, parts
+) -> np.ndarray:
+    """在按顺序拼接的若干 K/V 段上计算 next-token logits。
+
+    ``parts`` 是可迭代的 ``(K, V)`` 二元组，按上下文顺序给出各段的可见部分；
+    最后一段的最后一行必须是 ``token_id`` 自身的 K/V。计算与
+    :func:`logits_from_kv` 使用同一公式，只是避免把历史拼成一个连续数组。
+    """
+    x = model["emb"][token_id]  # [D]
+    d = np.float32(model["d_model"])
+    q = x @ model["wq"]  # [D]
+
+    # 先对每个段分别求分数，再拼接：softmax 需要全局最大值，分两遍算。
+    scores_parts = [(K @ q) / np.sqrt(d) for K, _V in parts]
+    scores = np.concatenate(scores_parts) if scores_parts else np.zeros(0, np.float32)
+    weights = _softmax(scores)
+
+    context = np.zeros(model["d_model"], dtype=np.float32)
+    offset = 0
+    for _K, V in parts:
+        n = V.shape[0]
+        context += weights[offset : offset + n] @ V
+        offset += n
+
+    hidden = x + context @ model["wo"]  # 残差连接
+    return (hidden @ model["wout"] + model["bout"]).astype(np.float32)
 
 
 def forward_full(model: dict, token_ids: list[int]) -> np.ndarray:

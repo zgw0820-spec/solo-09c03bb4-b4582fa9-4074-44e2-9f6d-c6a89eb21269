@@ -54,12 +54,12 @@ def test_create_fork_append_close_flow_and_logits_consistency(client):
         truncated["logits"], truncated["full_recompute_logits"], rtol=1e-5, atol=1e-6
     )
 
-    # 4) 子分支批量追加（COW），父分支不受影响
+    # 4) 子分支批量追加：继承前缀继续共享，只为新增 token 保存新 KV
     r = client.post(f"/branches/{child['branch_id']}/tokens", json={"token_ids": [5, 6]})
     assert r.status_code == 200
     grown = r.json()
     assert grown["token_ids"] == [1, 2, 3, 4, 5, 6]
-    assert grown["usage"]["occupied_tokens"] == 10  # 父 KV 4 + 子 KV 6
+    assert grown["usage"]["occupied_tokens"] == 6  # 父上下文 4 + 本次新增 2
     np.testing.assert_allclose(
         grown["logits"], grown["full_recompute_logits"], rtol=1e-5, atol=1e-6
     )
@@ -71,7 +71,7 @@ def test_create_fork_append_close_flow_and_logits_consistency(client):
     # 5) 关闭父分支：截断/完整子分支仍存活，KV 不被提前释放
     r = client.delete(f"/branches/{root_id}")
     assert r.status_code == 200
-    assert r.json()["usage"]["occupied_tokens"] == 10
+    assert r.json()["usage"]["occupied_tokens"] == 6
 
     # 6) 关闭所有分支后占用归零
     for bid in (child["branch_id"], truncated["branch_id"]):
@@ -154,3 +154,43 @@ def test_fork_from_empty_context(client):
     r = client.post(f"/branches/{bid}/fork", json={})
     assert r.status_code == 200
     assert r.json()["length"] == 0
+
+
+def test_413_preserves_tokens_kv_refs_and_usage(client):
+    # 父分支 6 个 token，截断分叉到前 2 个，再追加 1 个 -> 共占 7。
+    root = client.post("/branches", json={"token_ids": [1, 2, 3, 4, 5, 6]}).json()
+    child = client.post(
+        f"/branches/{root['branch_id']}/fork", json={"offset": 2}
+    ).json()
+    r = client.post(
+        f"/branches/{child['branch_id']}/tokens", json={"token_ids": [9]}
+    )
+    assert r.status_code == 200
+    assert r.json()["usage"]["occupied_tokens"] == 7
+    np.testing.assert_allclose(
+        r.json()["logits"], r.json()["full_recompute_logits"], rtol=1e-5, atol=1e-6
+    )
+
+    before_state = client.get("/branches").json()
+    before_stats = client.get("/stats").json()
+
+    # 容量 12，当前 7：追加 6 个会到 13 -> 413。
+    r = client.post(
+        f"/branches/{child['branch_id']}/tokens",
+        json={"token_ids": [10, 11, 12, 13, 14, 15]},
+    )
+    assert r.status_code == 413
+    assert r.json()["error"] == "capacity_exceeded"
+    assert r.json()["usage"] == before_stats
+
+    # 分支内容、KV 引用结构与用量全部保持原值。
+    assert client.get("/branches").json() == before_state
+    assert client.get("/stats").json() == before_stats
+
+    # 关闭父分支：只保留子分支可见的 2 行前缀 + 新增 1 行 = 3。
+    closed = client.delete(f"/branches/{root['branch_id']}").json()
+    assert closed["usage"]["occupied_tokens"] == 3
+    np.testing.assert_allclose(
+        client.get("/branches").json()["branches"][0]["tokens"],
+        [1, 2, 9],
+    )
